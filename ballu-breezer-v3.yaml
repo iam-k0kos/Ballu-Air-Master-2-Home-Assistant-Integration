@@ -1,44 +1,25 @@
-# Ballu Air Master 2 BMAC-300 — локальное управление через ESPHome (v2)
+# Ballu Air Master 2 BMAC-300 — локальное управление через ESPHome
 #
-# ПРОТОКОЛ (UART 9600 8N1), восстановлен по захватам логическим анализатором:
-#   кадр:  AA | LEN | LEN байт данных | сумма всех предыдущих байт (mod 256)
+# ПРОТОКОЛ (UART 9600 8N1):
+#   кадр: AA | LEN | LEN байт данных | сумма всех предыдущих байт (mod 256)
 #   плата -> модуль: AA 13 {09|8A|88} ... (22 байта) — состояние:
-#       [3] флаги: 0x01 питание, 0x20 ионизатор, 0x40 УФ-лампа
-#       [5] заданная температура 5..25,  [18] скорость 1..5
-#   модуль -> плата: AA 12 0A ... (21 байт) — команда, повторяется каждые 0,5 с до ответа:
-#       [3] флаги, [5] температура, [17] скорость, [6..14] копия состояния
+#     [3] флаги: 0x01 питание, 0x20 ионизатор, 0x40 УФ-лампа
+#     [5] температура 5..25, [18] скорость 1..5
+#   модуль -> плата: AA 12 0A ... (21 байт) — команда:
+#     [3] флаги, [5] температура, [17] скорость, [6..14] копия состояния
 #
-# ПОДКЛЮЧЕНИЕ (родной модуль ОТКЛЮЧИТЬ):
-#   пин разъёма "RX" (плата шлёт данные) -> GPIO3. Если на пине 4–5 В: делитель 4,7 кОм + 10 кОм на GND;
-#     если там 3,3 В: БЕЗ делителя, напрямую (или через 1 кОм)
-#   пин разъёма "TX" (модуль слал команды) <- GPIO4 через 330–470 Ом
-#   GND к GND, +5V к 5V ESP.
-#
-# ЧТО ИЗМЕНЕНО В v3 (по новому захвату родного модуля):
-#  * диапазон температуры 5..25 °C (в захвате плата принимает 0x05..0x19);
-#  * разбор кадров по структуре (AA, длина, сумма) без привязки ко времени: раньше при
-#    задержке цикла из-за логов буфер сбрасывался посреди кадра, и состояние терялось;
-#  * в HA состояние публикуется только при изменении (раньше числа слались ~200 раз/с —
-#    это перегружало Wi-Fi/API и давало задержки и неверный статус ионизатора/УФ);
-#  * отладочный лог всех байтов убран, уровень логов INFO; пишутся только команды и изменения;
-#  * keep-alive как у родного модуля: heartbeat «подключено» (AA 03 06 03 CC) раз в 5 с,
-#    опрос состояния раз в 15 с (остальное плата присылает сама при изменениях);
-#  * мощность Wi-Fi 15 дБ; убраны IP/SSID/BSSID, оставлен уровень сигнала.
-#
-# ИЗМЕНЕНИЯ v2:
-#  * команда собирается в момент ОТПРАВКИ из самого свежего состояния платы, а не в момент
-#    нажатия: быстрые нажатия (УФ + ионизатор) не затирают друг друга;
-#  * переключатели не восстанавливают старое состояние при загрузке (раньше ESPHome мог
-#    после перезагрузки выполнить сохранённые действия — отсюда «лишние» включения);
-#  * в лог пишется каждая отправляемая команда (флаги/темп./скорость) и текущее состояние;
-#  * Wi-Fi: максимальная мощность, без энергосбережения, датчик уровня сигнала в HA.
+# ПОДКЛЮЧЕНИЕ (родной Wi-Fi модуль отключить):
+#   "RX" разъёма (плата шлёт данные) -> GPIO3
+#       4–5 В на пине: делитель 4,7 кОм + 10 кОм на GND; 3,3 В: напрямую или через 1 кОм
+#   "TX" разъёма (команды на плату) <- GPIO4 через 330–470 Ом
+#   GND -> GND, +5V -> 5V ESP
 
 esphome:
   name: ballu-breezer
   on_boot:
     priority: -100
     then:
-      # последовательность, которую родной модуль шлёт после включения (по захвату)
+      # стартовая последовательность родного модуля
       - delay: 3s
       - uart.write: [0xAA, 0x02, 0x03, 0x02, 0xCC]        # Wi-Fi: подключение
       - delay: 2700ms
@@ -50,7 +31,7 @@ esphome:
       - uart.write: [0xAA, 0x01, 0x01, 0xAC]
 
 esp32:
-  board: esp32-c3-devkitm-1     # для классического ESP32: board: esp32dev, пины UART ниже 17/16
+  board: esp32-c3-devkitm-1     # классический ESP32: esp32dev, UART на GPIO17/16
   framework:
     type: esp-idf
 
@@ -58,6 +39,8 @@ logger:
   level: INFO
 
 api:
+  encryption:
+    key: !secret ballu_breezer__encryption_key
 
 ota:
   platform: esphome
@@ -65,25 +48,16 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  power_save_mode: none          # без энергосбережения: стабильнее связь и ниже задержка
-  output_power: 15dB             # если не подключается/отваливается — 11dB или 8.5dB
+  power_save_mode: none
+  output_power: 15dB             # при обрывах связи — 11dB или 8.5dB
 
 uart:
   id: bz
-  tx_pin: GPIO4                  # классический ESP32: GPIO17
-  rx_pin: GPIO3                  # классический ESP32: GPIO16
+  tx_pin: GPIO4
+  rx_pin: GPIO3
   baud_rate: 9600
 
 globals:
-  - id: rx_bytes
-    type: uint32_t
-    initial_value: '0'
-  - id: rx_good
-    type: uint32_t
-    initial_value: '0'
-  - id: rx_bad
-    type: uint32_t
-    initial_value: '0'
   - id: rxbuf
     type: std::vector<uint8_t>
   - id: last_rx_ms
@@ -93,8 +67,7 @@ globals:
     type: bool
     initial_value: 'false'
   - id: raw
-    type: std::vector<uint8_t>     # последний валидный кадр состояния (22 байта)
-  # состояние платы
+    type: std::vector<uint8_t>     # последний кадр состояния (22 байта)
   - id: s_flags
     type: uint8_t
     initial_value: '0'
@@ -104,7 +77,7 @@ globals:
   - id: s_speed
     type: uint8_t
     initial_value: '3'
-  # ожидающее изменение: какие биты флагов менять (pm_mask) и их нужные значения (pm_val)
+  # ожидающая команда: pm_mask — какие биты флагов менять, pm_val — их значения
   - id: pend
     type: bool
     initial_value: 'false'
@@ -130,8 +103,9 @@ globals:
     type: uint8_t
     initial_value: '0'
 
+# Команды не шлются сразу, а ставятся в очередь: кадр собирается при отправке
+# из свежего состояния платы, поэтому быстрые нажатия не затирают друг друга.
 script:
-  # изменить один бит флагов (питание/ионизатор/УФ)
   - id: queue_flag
     mode: queued
     parameters:
@@ -162,38 +136,34 @@ script:
           id(p_tries) = 0; id(pend) = true;
 
 interval:
-  # ---- приём и разбор кадров (по структуре: AA | LEN | данные | сумма) ----
+  # ---- приём и разбор кадров по структуре (AA | LEN | данные | сумма) ----
   - interval: 20ms
     then:
       - lambda: |-
           auto &buf = id(rxbuf);
           uint32_t now = millis();
-          // «зависший» хвост неполного кадра (> 200 мс тишины) — выбросить
+          // неполный кадр после 200 мс тишины — выбросить
           if (!buf.empty() && (now - id(last_rx_ms)) > 200) buf.clear();
           uint8_t b;
           while (id(bz).available() && id(bz).read_byte(&b)) {
             id(last_rx_ms) = now;
-            id(rx_bytes)++;
             buf.push_back(b);
-            // обработать всё, что можно разобрать
             while (!buf.empty()) {
               if (buf[0] != 0xAA) { buf.erase(buf.begin()); continue; }
               if (buf.size() < 3) break;
-              // особый короткий кадр платы AA 02 05 xx (4 байта, без суммы) — пропустить
+              // короткий кадр платы AA 02 05 xx (4 байта, без суммы) — пропустить
               if (buf[1] == 0x02 && buf[2] == 0x05) {
                 if (buf.size() < 4) break;
                 buf.erase(buf.begin(), buf.begin() + 4);
                 continue;
               }
               size_t need = (size_t) buf[1] + 3;
-              if (need > 40) { buf.erase(buf.begin()); continue; }   // не похоже на кадр
-              if (buf.size() < need) break;                          // ждём остаток
+              if (need > 40) { buf.erase(buf.begin()); continue; }
+              if (buf.size() < need) break;
               uint8_t sum = 0;
               for (size_t i = 0; i + 1 < need; i++) sum += buf[i];
               if (sum != buf[need - 1]) {
-                // «CC»-кадры (heartbeat/статус) сумме не подчиняются — это нормально
-                if (buf[need - 1] != 0xCC) id(rx_bad)++;
-                buf.erase(buf.begin());                              // сдвиг на 1 байт, поиск следующего AA
+                buf.erase(buf.begin());
                 continue;
               }
               if (need == 22 && buf[1] == 0x13 &&
@@ -203,7 +173,12 @@ interval:
                 id(raw) = std::vector<uint8_t>(buf.begin(), buf.begin() + need);
                 id(s_flags) = fl; id(s_temp) = tp; id(s_speed) = sp;
                 id(have_state) = true;
-                id(rx_good)++;
+                // температура входящего воздуха — байт [19], со знаком
+                {
+                  float air = (float) (int8_t) buf[19];
+                  if (!id(air_temp).has_state() || id(air_temp).state != air) id(air_temp).publish_state(air);
+                }
+                // в HA публикуем только изменения
                 if (changed) {
                   ESP_LOGI("ballu", "состояние: питание=%d ионизатор=%d УФ=%d темп=%u скорость=%u",
                            (int) ((fl & 0x01) != 0), (int) ((fl & 0x20) != 0), (int) ((fl & 0x40) != 0), (unsigned) tp, (unsigned) sp);
@@ -218,7 +193,7 @@ interval:
             }
           }
 
-  # ---- отправка команды: повтор каждые 500 мс (как родной модуль), максимум 6 раз ----
+  # ---- отправка команды: повтор каждые 500 мс до подтверждения, максимум 6 раз ----
   - interval: 500ms
     then:
       - lambda: |-
@@ -228,7 +203,7 @@ interval:
           uint8_t speed = id(p_set_speed) ? id(p_speed) : id(s_speed);
           bool done = (flags == id(s_flags) && temp == id(s_temp) && speed == id(s_speed));
           if (done || id(p_tries) >= 6) {
-            if (!done) ESP_LOGW("ballu", "команда не подтверждена платой: хотим флаги=0x%02X темп=%u скорость=%u, у платы флаги=0x%02X темп=%u скорость=%u",
+            if (!done) ESP_LOGW("ballu", "команда не подтверждена: хотим флаги=0x%02X темп=%u скорость=%u, у платы флаги=0x%02X темп=%u скорость=%u",
                                 (unsigned) flags, (unsigned) temp, (unsigned) speed, (unsigned) id(s_flags), (unsigned) id(s_temp), (unsigned) id(s_speed));
             id(pend) = false; id(pm_mask) = 0; id(pm_val) = 0;
             id(p_set_temp) = false; id(p_set_speed) = false;
@@ -247,32 +222,30 @@ interval:
           uint8_t sum = 0;
           for (int i = 0; i < 20; i++) sum += f[i];
           f[20] = sum;
-          ESP_LOGI("ballu", "КОМАНДА #%u: флаги=0x%02X темп=%u скорость=%u (состояние платы: флаги=0x%02X темп=%u скорость=%u)",
-                   (unsigned) id(p_tries) + 1, (unsigned) flags, (unsigned) temp, (unsigned) speed,
-                   (unsigned) id(s_flags), (unsigned) id(s_temp), (unsigned) id(s_speed));
           id(bz).write_array(f, 21);
           id(p_tries)++;
 
-  # ДИАГНОСТИКА: раз в минуту счётчики приёма
-  - interval: 60s
-    then:
-      - lambda: |-
-          ESP_LOGI("ballu", "RX bytes=%u good_state_frames=%u bad_checksum=%u have_state=%d",
-                   (unsigned) id(rx_bytes), (unsigned) id(rx_good), (unsigned) id(rx_bad),
-                   (int) id(have_state));
-
-  # KEEP-ALIVE как у родного модуля: heartbeat «подключено» раз в 5 с
+  # heartbeat «Wi-Fi подключён», как у родного модуля
   - interval: 5s
     then:
       - uart.write: [0xAA, 0x03, 0x06, 0x03, 0xCC]
 
-  # Опрос состояния раз в 15 с (изменения плата присылает сама кадром AA 13 09 ...)
+  # опрос состояния (изменения плата присылает сама)
   - interval: 15s
     then:
       - uart.write: [0xAA, 0x03, 0x08, 0x10, 0x04, 0xC9]
 
-# ---- Wi-Fi: уровень сигнала в Home Assistant ----
+# ---- датчики ----
 sensor:
+  # значение берётся из кадра состояния (см. разбор выше), своего опроса нет
+  - platform: template
+    id: air_temp
+    name: "Температура входящего воздуха"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
   - platform: wifi_signal
     id: wifi_dbm
     name: "Бризер Wi-Fi сигнал"
@@ -286,11 +259,13 @@ sensor:
     entity_category: diagnostic
     filters:
       - lambda: return std::min(100.0f, std::max(0.0f, 2.0f * (x + 100.0f)));
-  - platform: uptime
-    name: "Бризер время работы"
+  - platform: internal_temperature
+    name: "Бризер температура чипа"   # норма до 60–65 °C
+    update_interval: 60s
     entity_category: diagnostic
 
-# ---- сущности Home Assistant ----
+# ---- управление ----
+# restore_mode: DISABLED — после перезагрузки ESP не повторяет старые действия
 switch:
   - platform: template
     id: sw_power
@@ -298,15 +273,9 @@ switch:
     optimistic: false
     restore_mode: DISABLED
     turn_on_action:
-      - script.execute:
-          id: queue_flag
-          mask: 1
-          val: true
+      - script.execute: { id: queue_flag, mask: 1, val: true }
     turn_off_action:
-      - script.execute:
-          id: queue_flag
-          mask: 1
-          val: false
+      - script.execute: { id: queue_flag, mask: 1, val: false }
 
   - platform: template
     id: sw_ion
@@ -314,15 +283,9 @@ switch:
     optimistic: false
     restore_mode: DISABLED
     turn_on_action:
-      - script.execute:
-          id: queue_flag
-          mask: 32
-          val: true
+      - script.execute: { id: queue_flag, mask: 32, val: true }
     turn_off_action:
-      - script.execute:
-          id: queue_flag
-          mask: 32
-          val: false
+      - script.execute: { id: queue_flag, mask: 32, val: false }
 
   - platform: template
     id: sw_uv
@@ -330,15 +293,9 @@ switch:
     optimistic: false
     restore_mode: DISABLED
     turn_on_action:
-      - script.execute:
-          id: queue_flag
-          mask: 64
-          val: true
+      - script.execute: { id: queue_flag, mask: 64, val: true }
     turn_off_action:
-      - script.execute:
-          id: queue_flag
-          mask: 64
-          val: false
+      - script.execute: { id: queue_flag, mask: 64, val: false }
 
 number:
   - platform: template
